@@ -1,23 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server'
 import mammoth from 'mammoth'
 
+// Use dynamic import for pdf-parse-new to avoid build issues
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  try {
+    const pdfParse = require('pdf-parse-new')
+    const data = await pdfParse(buffer)
+    return data.text || ''
+  } catch (error) {
+    console.error('PDF parse error:', error)
+    throw error
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
+    console.log('API: Processing file upload request')
+    
     const formData = await request.formData()
     const file = formData.get('file') as File
+    
+    console.log('API: File received:', file?.name, file?.size)
     
     if (!file) {
       return NextResponse.json({ error: 'Geen bestand gevonden' }, { status: 400 })
     }
 
-    // Check file type - now supports multiple formats
+    // Check file type - support both PDF and DOCX
     const fileName = file.name.toLowerCase()
     const isDocx = fileName.endsWith('.docx')
     const isPdf = fileName.endsWith('.pdf')
-    const isCsv = fileName.endsWith('.csv')
     
-    if (!isDocx && !isPdf && !isCsv) {
-      return NextResponse.json({ error: 'Ondersteunde formaten: .docx, .pdf, .csv' }, { status: 400 })
+    if (!isDocx && !isPdf) {
+      return NextResponse.json({ error: 'Alleen .pdf en .docx bestanden zijn ondersteund' }, { status: 400 })
     }
 
     // Check file size (max 10MB)
@@ -25,66 +40,70 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Bestand is te groot (max 10MB)' }, { status: 400 })
     }
 
+    console.log('API: Converting file to buffer...')
+    
     // Convert file to buffer
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
+    console.log('API: Buffer created, size:', buffer.length)
 
     let textContent = ''
     let fileType = ''
 
     if (isDocx) {
-      // Extract text from .docx using mammoth
-      const result = await mammoth.extractRawText({ buffer })
-      textContent = result.value
-      fileType = 'Word Document (.docx)'
-    } else if (isPdf) {
-      // Extract text from .pdf using pdf-parse with dynamic import
+      console.log('API: Extracting text from DOCX with mammoth...')
+      
       try {
-        const pdfParse = (await import('pdf-parse')).default
-        const pdfData = await pdfParse(buffer)
-        textContent = pdfData.text
-        fileType = 'PDF Document (.pdf)'
-      } catch (pdfError) {
-        console.error('PDF parsing error:', pdfError)
-        return NextResponse.json({ error: 'Fout bij het lezen van het PDF bestand' }, { status: 400 })
+        const result = await mammoth.extractRawText({ buffer })
+        textContent = result.value || ''
+        fileType = 'Word Document (.docx)'
+        console.log('DOCX text extracted successfully, length:', textContent.length)
+      } catch (error) {
+        console.error('Error extracting DOCX:', error)
+        throw new Error('Failed to extract text from Word document')
       }
-    } else if (isCsv) {
-      // Parse CSV file
+      
+    } else if (isPdf) {
+      console.log('API: Extracting text from PDF...')
+      fileType = 'PDF Document (.pdf)'
+      
       try {
-        const csvText = buffer.toString('utf-8')
-        const lines = csvText.split('\n').filter(line => line.trim().length > 0)
+        // Use the simpler pdf-parse-new library
+        textContent = await extractPdfText(buffer)
         
-        if (lines.length === 0) {
-          return NextResponse.json({ error: 'CSV bestand is leeg' }, { status: 400 })
+        // Clean up the extracted text - be careful not to destroy formatting
+        textContent = textContent
+          .replace(/\r\n/g, '\n') // Normalize line endings
+          .replace(/\n{3,}/g, '\n\n') // Remove excessive line breaks
+          .replace(/[ \t]+/g, ' ') // Normalize spaces and tabs (but keep newlines)
+          .trim()
+        
+        console.log('PDF text extracted successfully, length:', textContent.length)
+        
+        if (!textContent || textContent.length < 10) {
+          console.warn('PDF has very little or no text content')
+          textContent = '[PDF bevat geen leesbare tekst. Dit kan gebeuren bij gescande documenten of afbeeldingen. Probeer een ander bestand of kopieer de tekst handmatig.]'
         }
+          
+      } catch (pdfError) {
+        console.error('PDF extraction failed:', pdfError)
         
-        // Parse CSV into readable format
-        const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''))
-        const rows = lines.slice(1, Math.min(11, lines.length)) // Limit to first 10 rows for preview
+        // Provide helpful error message
+        const errorMsg = pdfError instanceof Error ? pdfError.message : 'Unknown error'
         
-        let formattedContent = `CSV Data (${lines.length - 1} rijen, ${headers.length} kolommen)\n\n`
-        formattedContent += `Kolommen: ${headers.join(', ')}\n\n`
-        
-        // Add sample data
-        formattedContent += 'Eerste 10 rijen:\n'
-        rows.forEach((row, index) => {
-          const values = row.split(',').map(v => v.trim().replace(/"/g, ''))
-          formattedContent += `${index + 1}. ${values.join(' | ')}\n`
-        })
-        
-        if (lines.length > 11) {
-          formattedContent += `\n... en nog ${lines.length - 11} rijen`
+        if (errorMsg.includes('encrypted') || errorMsg.includes('password')) {
+          textContent = '[PDF is beveiligd met een wachtwoord. Upload een onbeveiligd bestand.]'
+        } else if (errorMsg.includes('Invalid PDF')) {
+          textContent = '[PDF bestand is beschadigd of ongeldig. Probeer een ander bestand.]'
+        } else {
+          textContent = '[PDF kon niet worden gelezen. Probeer een ander bestand of kopieer de tekst handmatig.]'
         }
-        
-        textContent = formattedContent
-        fileType = 'CSV Data (.csv)'
-      } catch (csvError) {
-        console.error('CSV parsing error:', csvError)
-        return NextResponse.json({ error: 'Fout bij het lezen van het CSV bestand' }, { status: 400 })
       }
     }
+    
+    console.log('API: Final text length:', textContent.length)
 
-    return NextResponse.json({
+    const response = {
       success: true,
       filename: file.name,
       size: file.size,
@@ -92,12 +111,18 @@ export async function POST(request: NextRequest) {
       content: textContent,
       wordCount: textContent.split(/\s+/).filter(word => word.length > 0).length,
       characterCount: textContent.length
-    })
+    }
+    
+    console.log('API: Sending response')
+    return NextResponse.json(response)
 
   } catch (error) {
     console.error('Error processing file:', error)
+    
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    
     return NextResponse.json(
-      { error: 'Er is een fout opgetreden bij het verwerken van het bestand' },
+      { error: 'Er is een fout opgetreden bij het verwerken van het bestand: ' + errorMessage },
       { status: 500 }
     )
   }
@@ -108,4 +133,4 @@ export async function GET() {
     { error: 'GET method not allowed. Use POST to upload files.' },
     { status: 405 }
   )
-} 
+}
